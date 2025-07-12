@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+  release:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release branch
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git checkout -b releases/${{ github.run_number }}
+          git push origin releases/${{ github.run_number }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Yandex Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: cr.yandex
+          username: json_key
+          password: ${{ secrets.YC_SA_JSON_CREDENTIALS }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }}
+            cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }}_latest
+
+      - name: Create git tag
+        run: |
+          git tag v${{ github.run_number }}
+          git push origin v${{ github.run_number }}
+
+      - name: Get commit list
+        id: commits
+        run: |
+          # Получаем предыдущий релизный тег
+          PREV_TAG=$(git describe --tags --match="v*" --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline --pretty=format:"- %s (%h)")
+          else
+            COMMITS=$(git log --oneline --pretty=format:"- %s (%h)" $PREV_TAG..HEAD)
+          fi
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update CHANGELOG
+        run: |
+          DATE=$(date '+%Y-%m-%d')
+          PREV_TAG=$(git describe --tags --match="v*" --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline --pretty=format:"- %s (%h)")
+          else
+            COMMITS=$(git log --oneline --pretty=format:"- %s (%h)" $PREV_TAG..HEAD)
+          fi
+
+          # Создаем временный файл с новой записью
+          echo "# Version ${{ github.run_number }} ($DATE)" > temp_changelog.md
+          echo "" >> temp_changelog.md
+          echo "$COMMITS" >> temp_changelog.md
+          echo "" >> temp_changelog.md
+
+          # Добавляем существующий CHANGELOG
+          if [ -f CHANGELOG.md ]; then
+            cat CHANGELOG.md >> temp_changelog.md
+          fi
+
+          # Заменяем CHANGELOG
+          mv temp_changelog.md CHANGELOG.md
+
+          # Коммитим изменения
+          git add CHANGELOG.md
+          git commit -m "Update CHANGELOG for version ${{ github.run_number }}"
+          git push origin main
+
+      - name: Create GitHub Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date().toISOString().split('T')[0];
+            const commits = `${{ steps.commits.outputs.commits }}`;
+
+            const issueBody = `
+            ## Релиз версии ${{ github.run_number }}
+
+            **Дата:** ${date}
+            **Автор релиза:** ${{ github.actor }}
+            **Версия:** ${{ github.run_number }}
+
+            ### Список коммитов:
+            ${commits}
+
+            ### Docker образ:
+            \`cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }}\`
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Релиз v${{ github.run_number }}`,
+              body: issueBody,
+              labels: ['release']
+            });

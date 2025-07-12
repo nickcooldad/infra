@@ -1,0 +1,84 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version to deploy"
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Yandex Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: cr.yandex
+          username: json_key
+          password: ${{ secrets.YC_SA_JSON_CREDENTIALS }}
+
+      - name: Check if image exists
+        run: |
+          docker manifest inspect cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ inputs.release_version }}_latest
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+
+            docker stop shri-app || true
+            docker rm shri-app || true
+
+
+            docker image prune -f
+
+
+            echo '${{ secrets.YC_SA_JSON_CREDENTIALS }}' | docker login --username json_key --password-stdin cr.yandex
+
+
+            docker pull cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ inputs.release_version }}_latest
+            docker run -d --name shri-app -p 3000:3000 --restart unless-stopped cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ inputs.release_version }}_latest
+
+      - name: Add deployment comment to release issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date().toISOString().split('T')[0];
+
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'release',
+              state: 'open'
+            });
+
+            const releaseIssue = issues.data.find(issue => 
+              issue.title.includes(`v${{ inputs.release_version }}`)
+            );
+
+            if (releaseIssue) {
+              const commentBody = `
+              ## ✅ Релиз выкачен в продакшн
+              
+              **Дата деплоя:** ${date}
+              **Кто выкатил:** ${{ github.actor }}
+              **Версия:** ${{ inputs.release_version }}
+              
+              Приложение доступно по адресу: http://${{ secrets.SERVER_HOST }}:3000/hw/store
+              `;
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: releaseIssue.number,
+                body: commentBody
+              });
+            }
